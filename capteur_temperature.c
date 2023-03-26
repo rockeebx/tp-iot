@@ -1,60 +1,50 @@
 #include "contiki.h"
-#include "net/rime.h"
-#include "random.h"
+#include "net/ip/uip.h"
+#include "net/ipv6/uip-ds6.h"
+#include "net/ipv6/uip-udp-packet.h"
 #include <stdio.h>
-#include "dev/temperature-sensor.h"
-#include "protocol.h"
+#include <string.h>
+#include "dht11.h"
+#include "sha1.h"
 
-PROCESS(temp_sensor_process, "Temperature Sensor Process");
-AUTOSTART_PROCESSES(&temp_sensor_process);
+#define SERVER_IP_ADDR "fd00::1" // adresse IPv6 du serveur
 
-static struct broadcast_conn broadcast;
-static const struct broadcast_callbacks broadcast_call = {};
+static uip_ipaddr_t server_ipaddr;
+static struct uip_udp_conn *udp_conn;
 
-PROCESS_THREAD(temp_sensor_process, ev, data)
-{
-    static struct etimer timer;
-    static struct message msg;
-    static uint8_t msg_buffer[MAX_MESSAGE_LEN];
+PROCESS(udp_client_process, "UDP client process");
 
-    PROCESS_EXITHANDLER(broadcast_close(&broadcast);)
+AUTOSTART_PROCESSES(&udp_client_process);
 
-    PROCESS_BEGIN();
+static void calculate_checksum(char *msg, int len, char *checksum) {
+  sha1_context ctx;
+  sha1_starts(&ctx);
+  sha1_update(&ctx, (uint8_t*)msg, len);
+  sha1_finish(&ctx, (uint8_t*)checksum);
+}
 
-    // Initialisation de la connexion broadcast
-    broadcast_open(&broadcast, CHANNEL, &broadcast_call);
+PROCESS_THREAD(udp_client_process, ev, data) {
+  PROCESS_BEGIN();
 
-    while(1) {
-        // Attente d'une temporisation pour l'envoi du message
-        etimer_set(&timer, CLOCK_SECOND * SEND_INTERVAL);
-        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
+  uip_ip6addr(&server_ipaddr, 0xfd00, 0, 0, 0, 0, 0, 0, 0x0001); //adresse IPv6 du serveur
+  udp_conn = udp_new(&server_ipaddr, UIP_HTONS(3000), NULL); //creation d'une nouvelle connexion UDP
 
-        // Récupération de la température
-        uint16_t temperature = (uint16_t) ((temperature_sensor.value() / 10) + 0.5);
-
-        // Création du message
-        msg.header.recipient = SERVER_ID;
-        msg.header.message_id = random_rand() % MAX_MESSAGE_ID;
-        msg.body.command = TEMPERATURE_UPDATE;
-        msg.body.temperature = temperature;
-        msg.footer.checksum = 0;
-
-        // Calcul du checksum
-        uint8_t *ptr = (uint8_t *) &msg;
-        uint16_t len = sizeof(struct message) - sizeof(msg.footer.checksum);
-        uint8_t checksum = 0;
-        for (uint16_t i = 0; i < len; i++) {
-            checksum ^= ptr[i];
-        }
-        msg.footer.checksum = checksum;
-
-        // Copie du message dans le buffer pour l'envoi
-        memcpy(msg_buffer, &msg, sizeof(struct message));
-
-        // Envoi du message
-        packetbuf_copyfrom(msg_buffer, sizeof(struct message));
-        broadcast_send(&broadcast);
+  while(1) {
+    static char buf[100];
+    int16_t temperature, humidity;
+    int res = dht11_read(&temperature, &humidity);
+    if(res == DHT11_SUCCESS) {
+      sprintf(buf, "{\"header\":{\"recipient\":\"server\",\"message_id\":123456},\"body\":{\"device_type\":\"temperature\",\"device_id\":\"temp_sensor01\",\"data\":{\"temperature\":%d,\"humidity\":%d}},\"footer\":{\"checksum\":\"\",\"flow_control\":\"start\"}}", temperature, humidity); //construction du message dans une chaîne de caractères avec les valeurs de température et d'humidité récupérées depuis le capteur
+      char checksum[20];
+      calculate_checksum(buf, strlen(buf), checksum); //calcul du checksum du message
+      sprintf(buf, "{\"header\":{\"recipient\":\"server\",\"message_id\":123456},\"body\":{\"device_type\":\"temperature\",\"device_id\":\"temp_sensor01\",\"data\":{\"temperature\":%d,\"humidity\":%d}},\"footer\":{\"checksum\":\"%s\",\"flow_control\":\"start\"}}", temperature, humidity, checksum); //ajout du checksum dans le champ "checksum" du message
+      uip_udp_packet_send(udp_conn, buf, strlen(buf)); //envoi du message par UDP
+      printf("Message sent: %s\n", buf); //affichage sur la console
+    } else {
+      printf("Failed to read temperature and humidity\n"); //affichage sur la console en cas d'erreur de lecture
     }
+    PROCESS_PAUSE();
+  }
 
-    PROCESS_END();
+  PROCESS_END();
 }
